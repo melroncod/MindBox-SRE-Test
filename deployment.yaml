@@ -1,0 +1,141 @@
+# Namespace для изоляции окружения
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mindbox-app
+  labels:
+    env: production
+
+---
+# Деплой с гарантированным распределением и управлением ресурсами
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  namespace: mindbox-app
+spec:
+  replicas: 4  # Оптимальное количество по нагрузочным тестам
+  selector:
+    matchLabels:
+      app: web-app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1  # Контролируемое обновление
+      maxUnavailable: 25%
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway  # Жесткое распределение между зонами
+          labelSelector:
+            matchLabels:
+              app: web-app
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway  # Распределение между нодами
+          labelSelector:
+            matchLabels:
+              app: web-app
+      containers:
+      - name: web-app
+        image: registry.example.com/web-app:v1.0
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 10  # Максимальное время инициализации + буфер
+          periodSeconds: 5
+          failureThreshold: 2
+        livenessProbe:
+          httpGet:
+            path: /livez
+            port: 8080
+          initialDelaySeconds: 15  # После readinessProbe
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: "100m"     # Базовый уровень для ровной нагрузки
+            memory: "128Mi" # Фиксированный объем
+          limits:
+            cpu: "500m"     # Покрытие пиков при холодном старте
+            memory: "128Mi" # Запрет на рост памяти
+
+---
+# Сервис для внутренней коммуникации
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-app-svc
+  namespace: mindbox-app
+spec:
+  type: ClusterIP
+  selector:
+    app: web-app
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+
+---
+# Гибридный Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app-hpa
+  namespace: mindbox-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 3  # По одному на зону (3 зоны)
+  maxReplicas: 6   # Запас сверх пиковой нагрузки
+  behavior:  # Плавное масштабирование
+    scaleDown:
+      stabilizationWindowSeconds: 900  # 15 мин для ночного спада
+      policies:
+      - type: Percent
+        value: 20
+        periodSeconds: 60
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: AverageValue  # Абсолютное значение лучше для стабильной нагрузки
+        averageValue: 80m   # 80% от request (100m) для плавного масштабирования
+
+---
+# Защита от одновременного выхода подов
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web-app-pdb
+  namespace: mindbox-app
+spec:
+  minAvailable: 2  # Разрешает обновление 1 пода за раз
+  selector:
+    matchLabels:
+      app: web-app
+
+---
+# Вертикальное масштабирование для оптимизации
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: web-app-vpa
+  namespace: mindbox-app
+spec:
+  targetRef:
+    apiVersion: "apps/v1"
+    kind: Deployment
+    name: web-app
+  updatePolicy:
+    updateMode: "Off"  # Режим рекомендаций для анализа
